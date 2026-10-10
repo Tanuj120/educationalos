@@ -6,7 +6,13 @@ from pathlib import Path
 import fitz
 from fastapi import HTTPException, UploadFile
 
-from app.main import detect_book_sections, save_upload_with_limit, validated_identity
+from app.main import (
+    detect_book_sections,
+    learner_twin_display_mastery,
+    save_upload_with_limit,
+    strongest_topic_for_display,
+    validated_identity,
+)
 
 
 class RoleProtectionTests(unittest.TestCase):
@@ -71,6 +77,19 @@ class BookSectionDetectionTests(unittest.TestCase):
             self.assertTrue(all(item["title"].startswith("Part ") for item in sections))
         finally:
             document.close()
+
+
+class LearnerTwinPresentationTests(unittest.TestCase):
+    def test_evidence_backed_mastery_never_displays_as_zero(self):
+        self.assertEqual(learner_twin_display_mastery(0, 5), 25)
+        self.assertEqual(learner_twin_display_mastery(82, 5), 82)
+        self.assertEqual(learner_twin_display_mastery(0, 0), 0)
+
+    def test_strongest_topic_is_named_and_distinct_from_focus_when_possible(self):
+        focus = {"topic": "Subnetting", "mastery": 25, "signals": 8, "correct": 0, "incorrect": 8, "confused": 0}
+        automata = {"topic": "Automata", "mastery": 42, "signals": 3, "correct": 1, "incorrect": 2, "confused": 0}
+        strongest = strongest_topic_for_display([focus, automata], focus)
+        self.assertEqual(strongest["topic"], "Automata")
 
 
 if __name__ == "__main__":

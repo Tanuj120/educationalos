@@ -93,6 +93,7 @@ RATE_LIMIT_WINDOW_SECONDS = int(os.getenv("RATE_LIMIT_WINDOW_SECONDS", "60"))
 RATE_LIMIT_AI_REQUESTS = int(os.getenv("RATE_LIMIT_AI_REQUESTS", "20"))
 RATE_LIMIT_UPLOAD_REQUESTS = int(os.getenv("RATE_LIMIT_UPLOAD_REQUESTS", "10"))
 RATE_LIMIT_WRITE_REQUESTS = int(os.getenv("RATE_LIMIT_WRITE_REQUESTS", "60"))
+LEARNER_TWIN_DISPLAY_FLOOR = int(os.getenv("LEARNER_TWIN_DISPLAY_FLOOR", "25"))
 EMBEDDINGS_UNAVAILABLE_UNTIL = 0.0
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -617,6 +618,27 @@ def difficulty_for_score(score: int) -> str:
     return "ADVANCED"
 
 
+def learner_twin_display_mastery(score: int, signals: int) -> int:
+    """Keep evidence-backed estimates readable without changing raw learning data."""
+    if signals <= 0:
+        return score
+    return max(LEARNER_TWIN_DISPLAY_FLOOR, min(100, score))
+
+
+def strongest_topic_for_display(topics: list[dict], focus: dict | None) -> dict | None:
+    """Always name the strongest tracked topic, even while mastery is still emerging."""
+    candidates = [item for item in topics if item["signals"]] or topics
+    if len(candidates) > 1 and focus:
+        alternatives = [item for item in candidates if item is not focus]
+        if alternatives:
+            candidates = alternatives
+    return max(
+        candidates,
+        key=lambda item: (item["mastery"], item["correct"], -item["incorrect"], -item["confused"], item["topic"]),
+        default=None,
+    )
+
+
 def unit_learning_state(db: Session, unit: Unit, user_id: str) -> dict:
     """Derive a unit's learning state from durable feedback and quiz attempts."""
     turns = db.query(ChatTurn).filter_by(owner_id=user_id, unit_id=unit.id).order_by(ChatTurn.created_at).all()
@@ -693,7 +715,8 @@ def learner_twin_state(db: Session, user_id: str) -> dict:
 
     topics = []
     for item in grouped.values():
-        item["mastery"] = round(item.pop("_mastery_total") / item.pop("unit_count"))
+        raw_mastery = round(item.pop("_mastery_total") / item.pop("unit_count"))
+        item["mastery"] = learner_twin_display_mastery(raw_mastery, item["signals"])
         item["units"] = list(dict.fromkeys(item["units"]))
         item["difficulty"] = difficulty_for_score(item["mastery"])
         item["status"] = "NEEDS_PRACTICE" if item["signals"] and item["mastery"] < 70 else "IMPROVING" if item["signals"] else "EXPLORING"
@@ -704,8 +727,7 @@ def learner_twin_state(db: Session, user_id: str) -> dict:
     focus = next((item for item in topics if item["status"] == "NEEDS_PRACTICE"), None)
     if not focus:
         focus = next((item for item in topics if item["status"] == "EXPLORING"), None)
-    strongest = max((item for item in assessed if item["mastery"] >= 70),
-                    key=lambda item: (item["mastery"], item["correct"], -item["incorrect"]), default=None)
+    strongest = strongest_topic_for_display(topics, focus)
     overall_mastery = round(sum(item["mastery"] for item in assessed) / len(assessed)) if assessed else None
     incorrect_count = sum(1 for quiz in answered_quizzes if quiz.answered_index != quiz.correct_index)
     correct_count = len(answered_quizzes) - incorrect_count
