@@ -43,6 +43,12 @@ const authScreens = new Set(['landing', 'login', 'signup']);
 const screenFromLocation = () => pathScreens[window.location.pathname.replace(/\/$/, '') || '/'] || 'notFound';
 const hasSession = () => localStorage.getItem(sessionKey) === 'active';
 const readStoredProfile = () => { try { return JSON.parse(localStorage.getItem(localKey) || '{}'); } catch { return {}; } };
+const requestIdentity = () => {
+  const profile = readStoredProfile();
+  const role = profile.role === 'teacher' ? 'teacher' : 'student';
+  const fallbackId = `${role === 'teacher' ? 'teacher' : 'user'}-${(profile.email || 'local@nexus.demo').trim().toLowerCase()}`;
+  return { userId: localStorage.getItem(userIdKey) || fallbackId, role };
+};
 const roleHome = (role) => role === 'teacher' ? 'teacher' : 'home';
 const canRoleAccess = (screen, role) => !teacherScreens.has(screen) && !studentScreens.has(screen)
   ? true
@@ -144,9 +150,10 @@ async function api(path, options = {}) {
   const { timeoutMs, ...requestOptions } = options;
   const controller = timeoutMs ? new AbortController() : null;
   const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
+  const identity = requestIdentity();
   try {
     const response = await fetch(`${API_URL}${path}`, { ...requestOptions, signal: controller?.signal || requestOptions.signal,
-      headers: { 'X-User-ID': localStorage.getItem(userIdKey) || 'local-user', 'X-User-Role': readStoredProfile().role || 'student', ...(requestOptions.headers || {}) } });
+      headers: { 'X-User-ID': identity.userId, 'X-User-Role': identity.role, ...(requestOptions.headers || {}) } });
     if (response.status === 204) return null;
     const body = await response.json().catch(() => null);
     if (!response.ok) throw new Error(body?.detail || `Request failed (${response.status})`);
@@ -163,10 +170,11 @@ async function api(path, options = {}) {
 
 async function streamAsk(payload, onEvent) {
   let response;
+  const identity = requestIdentity();
   try {
     response = await fetch(`${API_URL}/ask/stream`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Accept': 'text/event-stream', 'X-User-ID': localStorage.getItem(userIdKey) || 'local-user', 'X-User-Role': readStoredProfile().role || 'student' },
+      headers: { 'Content-Type': 'application/json', 'Accept': 'text/event-stream', 'X-User-ID': identity.userId, 'X-User-Role': identity.role },
       body: JSON.stringify(payload),
     });
   } catch (requestError) {
@@ -416,11 +424,18 @@ function DashboardShell({ title, children, go, profile, screen = 'home', logout 
 function Materials({ go, profile, courses, setCourses, addActivity, logout }) {
   const [courseTitle, setCourseTitle] = useState(''); const [courseDescription, setCourseDescription] = useState(''); const [activeCourse, setActiveCourse] = useState(null); const [unitTitle, setUnitTitle] = useState(''); const [notice, setNotice] = useState(''); const [viewingMaterial, setViewingMaterial] = useState(null);
   const selected = courses.find((course) => course.id === activeCourse);
+  const hasActiveUploads = courses.some((course) => course.units.some((unit) => unit.materials.some((material) => ['QUEUED', 'PROCESSING'].includes(material.status))));
   useEffect(() => { if (courses.length && !courses.some((course) => course.id === activeCourse)) setActiveCourse(courses[0].id); }, [courses, activeCourse]);
+  useEffect(() => {
+    if (!hasActiveUploads) return undefined;
+    const refresh = async () => { try { setCourses(await api('/courses')); } catch { /* Existing status remains visible until the next retry. */ } };
+    const timer = window.setInterval(refresh, 2000);
+    return () => window.clearInterval(timer);
+  }, [hasActiveUploads, setCourses]);
   const addCourse = async (event) => { event.preventDefault(); if (!courseTitle.trim()) return; const draft = { id: crypto.randomUUID(), title: courseTitle.trim(), description: courseDescription.trim(), units: [] }; try { const created = await api('/courses', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ title: draft.title, description: draft.description }) }); setCourses((old) => [created, ...old]); setActiveCourse(created.id); } catch { setCourses((old) => [draft, ...old]); setActiveCourse(draft.id); } addActivity(`Created course: ${draft.title}`); setCourseTitle(''); setCourseDescription(''); };
   const addUnit = async (event) => { event.preventDefault(); if (!selected || !unitTitle.trim()) return; const draft = { id: crypto.randomUUID(), title: unitTitle.trim(), materials: [] }; try { const created = await api(`/courses/${selected.id}/units`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ title: draft.title }) }); updateCourse(selected.id, (course) => ({ ...course, units: [...course.units, created] })); } catch { updateCourse(selected.id, (course) => ({ ...course, units: [...course.units, draft] })); } addActivity(`Added unit: ${draft.title}`); setUnitTitle(''); };
   const updateCourse = (id, transform) => setCourses((all) => all.map((course) => course.id === id ? transform(course) : course));
-  const upload = async (unit, fileList) => { const files = [...fileList]; if (!files.length) return; const queued = files.map((file) => ({ id: crypto.randomUUID(), name: file.name, status: 'QUEUED', chunk_count: 0 })); updateCourse(selected.id, (course) => ({ ...course, units: course.units.map((item) => item.id === unit.id ? { ...item, materials: [...item.materials, ...queued] } : item) })); const data = new FormData(); files.forEach((file) => data.append('files', file)); try { const stored = await api(`/units/${unit.id}/materials`, { method: 'POST', body: data }); updateCourse(selected.id, (course) => ({ ...course, units: course.units.map((item) => item.id === unit.id ? { ...item, materials: [...item.materials.filter((material) => !queued.some((queue) => queue.id === material.id)), ...stored] } : item) })); setNotice('PDFs uploaded. NEXUS is parsing and indexing them in the background.'); } catch { setNotice('PDFs are shown locally. Start the FastAPI backend to parse, embed, and store vectors.'); } files.forEach((file) => addActivity(`Added PDF: ${file.name}`)); };
+  const upload = async (unit, fileList) => { const files = [...fileList]; if (!files.length) return; const queued = files.map((file) => ({ id: crypto.randomUUID(), name: file.name, status: 'QUEUED', chunk_count: 0 })); updateCourse(selected.id, (course) => ({ ...course, units: course.units.map((item) => item.id === unit.id ? { ...item, materials: [...item.materials, ...queued] } : item) })); const data = new FormData(); files.forEach((file) => data.append('files', file)); try { const stored = await api(`/units/${unit.id}/materials`, { method: 'POST', body: data }); updateCourse(selected.id, (course) => ({ ...course, units: course.units.map((item) => item.id === unit.id ? { ...item, materials: [...item.materials.filter((material) => !queued.some((queue) => queue.id === material.id)), ...stored] } : item) })); setNotice('PDFs uploaded. NEXUS is parsing and indexing them in the background.'); files.forEach((file) => addActivity(`Added PDF: ${file.name}`)); } catch (error) { updateCourse(selected.id, (course) => ({ ...course, units: course.units.map((item) => item.id === unit.id ? { ...item, materials: item.materials.filter((material) => !queued.some((queue) => queue.id === material.id)) } : item) })); setNotice(error.message || 'The PDFs could not be uploaded.'); } };
   const removeCourse = async () => { if (!selected || !window.confirm(`Delete “${selected.title}” and every unit and PDF inside it? This cannot be undone.`)) return; try { await api(`/courses/${selected.id}`, { method: 'DELETE' }); setCourses((all) => all.filter((course) => course.id !== selected.id)); setActiveCourse(''); addActivity(`Deleted course: ${selected.title}`); setNotice('Course and its contents were deleted.'); } catch (error) { setNotice(error.message || 'Could not delete the course.'); } };
   const removeUnit = async (unit) => { if (!selected || !window.confirm(`Delete “${unit.title}” and every PDF inside it? This cannot be undone.`)) return; try { await api(`/units/${unit.id}`, { method: 'DELETE' }); updateCourse(selected.id, (course) => ({ ...course, units: course.units.filter((item) => item.id !== unit.id) })); addActivity(`Deleted unit: ${unit.title}`); setNotice('Unit and its PDFs were deleted.'); } catch (error) { setNotice(error.message || 'Could not delete the unit.'); } };
   const removeMaterial = async (unit, material) => { if (!selected || !window.confirm(`Delete “${material.name}”? This will remove its stored PDF and vectors.`)) return; try { await api(`/materials/${material.id}`, { method: 'DELETE' }); updateCourse(selected.id, (course) => ({ ...course, units: course.units.map((item) => item.id === unit.id ? { ...item, materials: item.materials.filter((entry) => entry.id !== material.id) } : item) })); addActivity(`Deleted PDF: ${material.name}`); setNotice('PDF and its vectors were deleted.'); } catch (error) { setNotice(error.message || 'Could not delete the PDF.'); } };

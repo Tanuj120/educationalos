@@ -3,6 +3,10 @@ from __future__ import annotations
 
 import math
 import json
+import logging
+import sys
+import threading
+from collections import defaultdict, deque
 def cosine_distance(a, b):
     if a is None or b is None: return 1.0
     if hasattr(a, "tolist"):
@@ -52,9 +56,9 @@ try:
 except ImportError:
     fitz = None
 
-from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, Header, HTTPException, Response, UploadFile, status
+from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, Header, HTTPException, Request, Response, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from google import genai
 from google.genai import types
 from pgvector.sqlalchemy import Vector
@@ -81,8 +85,26 @@ EMBEDDING_DIMENSIONS = 1536
 CHAT_MODEL = os.getenv("GEMINI_CHAT_MODEL", "gemini-3.8-flash")
 CHAT_MODELS = tuple(dict.fromkeys((CHAT_MODEL, "gemini-3.5-flash-lite", "gemini-3.5-flash", "gemini-3.6-flash")))
 EMBEDDING_RETRY_AFTER_SECONDS = int(os.getenv("EMBEDDING_RETRY_AFTER_SECONDS", "300"))
+MAX_PDF_UPLOAD_BYTES = int(os.getenv("MAX_PDF_UPLOAD_BYTES", str(25 * 1024 * 1024)))
+MAX_VIDEO_UPLOAD_BYTES = int(os.getenv("MAX_VIDEO_UPLOAD_BYTES", str(250 * 1024 * 1024)))
+MAX_FILES_PER_UPLOAD = int(os.getenv("MAX_FILES_PER_UPLOAD", "5"))
+RATE_LIMIT_WINDOW_SECONDS = int(os.getenv("RATE_LIMIT_WINDOW_SECONDS", "60"))
+RATE_LIMIT_AI_REQUESTS = int(os.getenv("RATE_LIMIT_AI_REQUESTS", "20"))
+RATE_LIMIT_UPLOAD_REQUESTS = int(os.getenv("RATE_LIMIT_UPLOAD_REQUESTS", "10"))
+RATE_LIMIT_WRITE_REQUESTS = int(os.getenv("RATE_LIMIT_WRITE_REQUESTS", "60"))
 EMBEDDINGS_UNAVAILABLE_UNTIL = 0.0
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    stream=sys.stdout,
+)
+logger = logging.getLogger("nexus.api")
+RATE_LIMIT_BUCKETS: dict[str, deque[float]] = defaultdict(deque)
+RATE_LIMIT_LOCK = threading.Lock()
+AI_METRICS = {"success": 0, "failure": 0, "fallback": 0}
+AI_METRICS_LOCK = threading.Lock()
 
 engine_options = {"pool_pre_ping": True}
 if DATABASE_URL.startswith("postgresql"):
@@ -367,9 +389,24 @@ def get_db() -> Generator[Session, None, None]:
         db.close()
 
 
-def current_user_id(x_user_id: str | None = Header(default=None)) -> str:
-    """Temporary ownership boundary until JWT auth is wired in."""
-    return x_user_id or "local-user"
+def validated_identity(x_user_id: str | None, x_user_role: str | None) -> tuple[str, str]:
+    """Validate the prototype identity boundary consistently until signed tokens replace headers."""
+    if not x_user_id or not x_user_role:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Sign in is required")
+    if x_user_role == "student" and x_user_id.startswith("user-"):
+        return x_user_id, x_user_role
+    if x_user_role == "teacher" and x_user_id.startswith("teacher-"):
+        return x_user_id, x_user_role
+    logger.warning("role_mismatch user_id=%s role=%s", x_user_id[:64], x_user_role[:32])
+    raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Account role does not match this session")
+
+
+def current_user_id(
+    x_user_id: str | None = Header(default=None),
+    x_user_role: str | None = Header(default=None),
+) -> str:
+    """Return a validated prototype identity; production should replace headers with signed sessions."""
+    return validated_identity(x_user_id, x_user_role)[0]
 
 
 def current_teacher_id(
@@ -377,9 +414,10 @@ def current_teacher_id(
     x_user_role: str | None = Header(default=None),
 ) -> str:
     """Reject student sessions at teacher-only API boundaries."""
-    if x_user_role != "teacher" or not (x_user_id or "").startswith("teacher-"):
+    user_id, role = validated_identity(x_user_id, x_user_role)
+    if role != "teacher":
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Teacher access required")
-    return x_user_id
+    return user_id
 
 
 def current_student_id(
@@ -387,9 +425,38 @@ def current_student_id(
     x_user_role: str | None = Header(default=None),
 ) -> str:
     """Keep student meeting history separate from teacher accounts."""
-    if x_user_role != "student" or not (x_user_id or "").startswith("user-"):
+    user_id, role = validated_identity(x_user_id, x_user_role)
+    if role != "student":
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Student access required")
-    return x_user_id
+    return user_id
+
+
+async def save_upload_with_limit(upload: UploadFile, destination: Path, byte_limit: int) -> int:
+    """Stream an upload to disk and stop before it can exceed the configured limit."""
+    total = 0
+    try:
+        with destination.open("wb") as output:
+            while chunk := await upload.read(1024 * 1024):
+                total += len(chunk)
+                if total > byte_limit:
+                    raise HTTPException(
+                        status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                        detail=f"{upload.filename or 'Upload'} exceeds the {byte_limit // (1024 * 1024)} MB limit",
+                    )
+                output.write(chunk)
+        if total == 0:
+            raise HTTPException(status_code=422, detail="Empty files cannot be uploaded")
+        return total
+    except Exception:
+        destination.unlink(missing_ok=True)
+        raise
+    finally:
+        await upload.close()
+
+
+def record_ai_result(result: str) -> None:
+    with AI_METRICS_LOCK:
+        AI_METRICS[result] += 1
 
 
 def serialize_material(material: Material) -> dict:
@@ -687,9 +754,9 @@ def embed_batch(chunks: list[str], task_type: str = "RETRIEVAL_DOCUMENT") -> lis
         if len(vectors) != len(chunks) or any(len(vector) != EMBEDDING_DIMENSIONS for vector in vectors):
             raise RuntimeError("Gemini returned an unexpected embedding batch")
         return vectors
-    except Exception as e:
+    except Exception:
         EMBEDDINGS_UNAVAILABLE_UNTIL = time.monotonic() + EMBEDDING_RETRY_AFTER_SECONDS
-        print(f"Embedding unavailable; lexical retrieval remains active. Error: {e}")
+        logger.exception("embedding_provider_failed fallback=lexical retry_after_seconds=%s", EMBEDDING_RETRY_AFTER_SECONDS)
         return [None for _ in chunks]
 
 
@@ -776,6 +843,8 @@ def generate_answer(question: str, unit_title: str, context: str, has_unsearchab
                     conversation: str = "", learning_context: str = "") -> str:
     """Generate a concise response, falling back visibly if Gemini is unavailable."""
     if not GEMINI_API_KEY:
+        record_ai_result("failure")
+        logger.warning("ai_request_failed reason=not_configured")
         return "I received your question, but Gemini is not configured yet. Add a Gemini API key to enable answers grounded in your study material."
     context_instruction = context or "No searchable text was available from this unit's PDFs."
     prompt = f"""You are NEXUS, a helpful learning assistant. Answer the student's question clearly and directly.
@@ -821,11 +890,14 @@ Read the document pages directly. Use prior turns to understand follow-ups. For 
                     try:
                         response = client.models.generate_content(model=model, contents=[native_prompt, *uploaded_files])
                         if response.text and response.text.strip():
+                            record_ai_result("success")
+                            logger.info("ai_request_succeeded model=%s mode=native_document", model)
                             return response.text.strip()
                     except Exception:
+                        logger.warning("ai_model_attempt_failed model=%s mode=native_document", model, exc_info=True)
                         continue
         except Exception:
-            pass
+            logger.warning("ai_native_document_upload_failed", exc_info=True)
     for model in CHAT_MODELS:
         try:
             response = client.models.generate_content(
@@ -834,10 +906,15 @@ Read the document pages directly. Use prior turns to understand follow-ups. For 
                 config=types.GenerateContentConfig(temperature=0.3, max_output_tokens=700),
             )
             if response.text and response.text.strip():
+                record_ai_result("success")
+                logger.info("ai_request_succeeded model=%s mode=rag", model)
                 return response.text.strip()
-        except Exception as e:
-            print('GEMINI EXCEPTION:', e)
+        except Exception:
+            logger.warning("ai_model_attempt_failed model=%s mode=rag", model, exc_info=True)
             continue
+    record_ai_result("failure")
+    record_ai_result("fallback")
+    logger.error("ai_request_failed fallback=grounded_extract")
     if has_unsearchable_material:
         return "Hi! I received your question. The selected PDF is available to view, but it is scanned and has no extractable text yet, so I cannot ground an answer in it until OCR is added."
     return grounded_fallback_answer(question, unit_title, context)
@@ -847,6 +924,8 @@ def stream_answer(question: str, unit_title: str, context: str, has_unsearchable
                   pdf_paths: list[str] | None = None, conversation: str = "", learning_context: str = "") -> Generator[str, None, None]:
     """Yield Gemini output as it is produced, with the same grounded prompt as normal answers."""
     if not GEMINI_API_KEY:
+        record_ai_result("failure")
+        logger.warning("ai_stream_failed reason=not_configured")
         yield "I received your question, but Gemini is not configured yet. Add a Gemini API key to enable answers grounded in your study material."
         return
     context_instruction = context or "No searchable text was available from this unit's PDFs."
@@ -906,11 +985,14 @@ Read the document pages directly. Use prior turns to understand follow-ups. For 
                             emitted = True
                             yield piece
                         if emitted:
+                            record_ai_result("success")
+                            logger.info("ai_stream_succeeded model=%s mode=native_document", model)
                             return
                     except Exception:
+                        logger.warning("ai_stream_attempt_failed model=%s mode=native_document", model, exc_info=True)
                         continue
         except Exception:
-            pass
+            logger.warning("ai_stream_document_upload_failed", exc_info=True)
     for model in CHAT_MODELS:
         try:
             emitted = False
@@ -918,10 +1000,15 @@ Read the document pages directly. Use prior turns to understand follow-ups. For 
                 emitted = True
                 yield piece
             if emitted:
+                record_ai_result("success")
+                logger.info("ai_stream_succeeded model=%s mode=rag", model)
                 return
-        except Exception as e:
-            print('GEMINI EXCEPTION:', e)
+        except Exception:
+            logger.warning("ai_stream_attempt_failed model=%s mode=rag", model, exc_info=True)
             continue
+    record_ai_result("failure")
+    record_ai_result("fallback")
+    logger.error("ai_stream_failed fallback=grounded_extract")
     if has_unsearchable_material:
         yield "Hi! I received your question. The selected PDF is available to view, but it is scanned and has no extractable text yet, so I cannot ground an answer in it until OCR is added."
     else:
@@ -931,6 +1018,7 @@ Read the document pages directly. Use prior turns to understand follow-ups. For 
 def ingest_material(material_id: str) -> None:
     """Parse a PDF, generate embeddings, and persist chunks in pgvector."""
     db = SessionLocal()
+    material: Material | None = None
     try:
         material = db.get(Material, material_id)
         if not material:
@@ -955,13 +1043,15 @@ def ingest_material(material_id: str) -> None:
         else:
             material.status = "INDEXED" if any(row.embedding is not None for row in rows) else "PARSED_AWAITING_EMBEDDINGS"
         db.commit()
-    except Exception as exc:  # no raw document content is surfaced
+        logger.info("material_processing_completed material_id=%s status=%s chunks=%s", material.id, material.status, len(rows))
+    except Exception:  # no raw document content is surfaced
         db.rollback()
         material = db.get(Material, material_id)
         if material:
             material.status = "FAILED"
-            material.error_message = str(exc)[:500]
+            material.error_message = "Document processing failed. Retry the upload or contact support with the request time."
             db.commit()
+        logger.exception("material_processing_failed material_id=%s", material_id)
     finally:
         db.close()
 
@@ -970,17 +1060,77 @@ app = FastAPI(title="NEXUS API", version="0.2.0")
 _default_dev_origins = ",".join([
     "http://localhost:3000", "http://127.0.0.1:3000",
     "http://localhost:4173", "http://127.0.0.1:4173",
+    "http://localhost:5173", "http://127.0.0.1:5173",
 ])
 frontend_origins = [
     origin.strip()
     for origin in os.getenv("FRONTEND_ORIGINS", _default_dev_origins).split(",")
     if origin.strip()
 ]
-# For development, allow all origins. Set FRONTEND_ORIGINS env var in production.
+
+
+def rate_limit_policy(request: Request) -> tuple[str, int] | None:
+    if request.method not in {"POST", "PUT", "PATCH", "DELETE"}:
+        return None
+    path = request.url.path
+    if path in {"/api/v1/ask", "/api/v1/ask/stream"}:
+        return "ai", RATE_LIMIT_AI_REQUESTS
+    if "/materials" in path or path == "/api/v1/teacher/videos":
+        return "upload", RATE_LIMIT_UPLOAD_REQUESTS
+    return "write", RATE_LIMIT_WRITE_REQUESTS
+
+
+@app.middleware("http")
+async def reliability_middleware(request: Request, call_next):
+    request_id = request.headers.get("X-Request-ID") or str(uuid.uuid4())
+    started = time.monotonic()
+    policy = rate_limit_policy(request)
+    remaining: int | None = None
+    if policy:
+        bucket_name, limit = policy
+        client_ip = request.client.host if request.client else "unknown"
+        user_id = request.headers.get("X-User-ID", "anonymous")[:128]
+        key = f"{client_ip}:{user_id}:{bucket_name}"
+        now = time.monotonic()
+        with RATE_LIMIT_LOCK:
+            bucket = RATE_LIMIT_BUCKETS[key]
+            while bucket and now - bucket[0] >= RATE_LIMIT_WINDOW_SECONDS:
+                bucket.popleft()
+            if len(bucket) >= limit:
+                retry_after = max(1, int(RATE_LIMIT_WINDOW_SECONDS - (now - bucket[0])))
+                logger.warning("rate_limit request_id=%s bucket=%s user_id=%s", request_id, bucket_name, user_id)
+                return JSONResponse(
+                    status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                    content={"detail": "Too many requests. Please wait briefly and try again.", "request_id": request_id},
+                    headers={"Retry-After": str(retry_after), "X-Request-ID": request_id},
+                )
+            bucket.append(now)
+            remaining = max(0, limit - len(bucket))
+    try:
+        response = await call_next(request)
+    except Exception:
+        logger.exception("unhandled_error request_id=%s method=%s path=%s", request_id, request.method, request.url.path)
+        return JSONResponse(
+            status_code=500,
+            content={"detail": "An unexpected server error occurred.", "request_id": request_id},
+            headers={"X-Request-ID": request_id},
+        )
+    duration_ms = round((time.monotonic() - started) * 1000, 1)
+    response.headers["X-Request-ID"] = request_id
+    if remaining is not None:
+        response.headers["X-RateLimit-Remaining"] = str(remaining)
+    log_method = logger.warning if response.status_code >= 400 else logger.info
+    log_method(
+        "request_completed request_id=%s method=%s path=%s status=%s duration_ms=%s",
+        request_id, request.method, request.url.path, response.status_code, duration_ms,
+    )
+    return response
+
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
+    allow_origins=frontend_origins,
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -999,12 +1149,29 @@ def initialise_database() -> None:
 
 
 @app.get("/health")
-def health() -> dict:
-    return {
+def health() -> Response:
+    global DATABASE_READY, DATABASE_ERROR
+    try:
+        with engine.connect() as connection:
+            connection.execute(text("SELECT 1"))
+        DATABASE_READY = True
+        DATABASE_ERROR = None
+    except Exception as error:
+        DATABASE_READY = False
+        DATABASE_ERROR = str(error)
+        logger.exception("database_health_check_failed")
+    payload = {
         "status": "ok" if DATABASE_READY else "degraded",
         "service": "nexus-api",
-        "database": "ready" if DATABASE_READY else "unavailable",
+        "checks": {
+            "api": "ready",
+            "database": "ready" if DATABASE_READY else "unavailable",
+            "uploads": "ready" if UPLOAD_DIR.is_dir() and os.access(UPLOAD_DIR, os.W_OK) else "unavailable",
+            "ai_provider": "configured" if GEMINI_API_KEY else "not_configured",
+        },
+        "ai_requests": dict(AI_METRICS),
     }
+    return JSONResponse(status_code=200 if DATABASE_READY else 503, content=payload)
 
 
 @app.get("/api/v1/courses")
@@ -1084,21 +1251,57 @@ async def upload_materials(unit_id: str, background_tasks: BackgroundTasks, file
     unit = db.query(Unit).join(Course).filter(Unit.id == unit_id, Course.owner_id == user_id).first()
     if not unit:
         raise HTTPException(status_code=404, detail="Unit not found")
-    created: list[Material] = []
+    if not files or len(files) > MAX_FILES_PER_UPLOAD:
+        raise HTTPException(status_code=422, detail=f"Upload between 1 and {MAX_FILES_PER_UPLOAD} PDFs at a time")
     for uploaded in files:
-        if uploaded.content_type != "application/pdf" and not (uploaded.filename or "").lower().endswith(".pdf"):
-            raise HTTPException(status_code=415, detail="Only PDF files are supported")
-        material_id = str(uuid.uuid4())
-        safe_name = re.sub(r"[^A-Za-z0-9._-]", "_", uploaded.filename or "material.pdf")
-        storage_path = UPLOAD_DIR / f"{material_id}_{safe_name}"
-        storage_path.write_bytes(await uploaded.read())
-        material = Material(id=material_id, unit_id=unit.id, original_name=uploaded.filename or "material.pdf", storage_key=str(storage_path), status="QUEUED")
-        db.add(material)
-        created.append(material)
-    db.commit()
+        suffix = Path(uploaded.filename or "").suffix.lower()
+        if suffix != ".pdf" or uploaded.content_type not in {"application/pdf", "application/octet-stream"}:
+            raise HTTPException(status_code=415, detail="Only valid PDF files are supported")
+    created: list[Material] = []
+    stored_paths: list[Path] = []
+    try:
+        for uploaded in files:
+            material_id = str(uuid.uuid4())
+            safe_name = re.sub(r"[^A-Za-z0-9._-]", "_", uploaded.filename or "material.pdf")
+            storage_path = UPLOAD_DIR / f"{material_id}_{safe_name}"
+            await save_upload_with_limit(uploaded, storage_path, MAX_PDF_UPLOAD_BYTES)
+            with storage_path.open("rb") as stored_file:
+                if stored_file.read(5) != b"%PDF-":
+                    storage_path.unlink(missing_ok=True)
+                    raise HTTPException(status_code=415, detail=f"{uploaded.filename or 'File'} is not a valid PDF")
+            stored_paths.append(storage_path)
+            material = Material(id=material_id, unit_id=unit.id, original_name=uploaded.filename or "material.pdf", storage_key=str(storage_path), status="QUEUED")
+            db.add(material)
+            created.append(material)
+        db.commit()
+    except Exception:
+        db.rollback()
+        for stored_path in stored_paths:
+            stored_path.unlink(missing_ok=True)
+        raise
     for material in created:
         background_tasks.add_task(ingest_material, material.id)
+    logger.info("materials_queued user_id=%s unit_id=%s count=%s", user_id, unit_id, len(created))
     return [serialize_material(material) for material in created]
+
+
+@app.get("/api/v1/materials/{material_id}/status")
+def material_processing_status(material_id: str, db: Session = Depends(get_db), user_id: str = Depends(current_user_id)) -> dict:
+    material = db.query(Material).join(Unit).join(Course).filter(Material.id == material_id, Course.owner_id == user_id).first()
+    if not material:
+        raise HTTPException(status_code=404, detail="Material not found")
+    return serialize_material(material)
+
+
+@app.get("/api/v1/uploads/status")
+def upload_processing_status(db: Session = Depends(get_db), user_id: str = Depends(current_user_id)) -> dict:
+    materials = db.query(Material).join(Unit).join(Course).filter(Course.owner_id == user_id).all()
+    status_counts: dict[str, int] = {}
+    for material in materials:
+        status_counts[material.status] = status_counts.get(material.status, 0) + 1
+    active = sum(status_counts.get(item, 0) for item in ("QUEUED", "PROCESSING"))
+    failed = status_counts.get("FAILED", 0)
+    return {"total": len(materials), "active": active, "failed": failed, "by_status": status_counts}
 
 
 @app.delete("/api/v1/materials/{material_id}")
@@ -1162,12 +1365,12 @@ async def upload_teacher_video(subject: str = Form(...), topic: str = Form(...),
                                db: Session = Depends(get_db), user_id: str = Depends(current_teacher_id)) -> dict:
     allowed = {".mp4", ".webm", ".mov", ".m4v"}
     suffix = Path(file.filename or "").suffix.lower()
-    if not (file.content_type or "").startswith("video/") and suffix not in allowed:
+    if not (file.content_type or "").startswith("video/") or suffix not in allowed:
         raise HTTPException(status_code=415, detail="Upload an MP4, WebM, MOV, or M4V video")
     video_id = str(uuid.uuid4())
     safe_name = re.sub(r"[^A-Za-z0-9._-]", "_", file.filename or "lecture.mp4")
     storage_path = UPLOAD_DIR / f"lecture_{video_id}_{safe_name}"
-    storage_path.write_bytes(await file.read())
+    await save_upload_with_limit(file, storage_path, MAX_VIDEO_UPLOAD_BYTES)
     video = VideoLecture(id=video_id, teacher_id=user_id, subject=subject.strip(), topic=topic.strip(),
                          title=title.strip(), description=(description or "").strip() or None,
                          storage_key=str(storage_path), media_type=file.content_type or "video/mp4")
@@ -1510,8 +1713,8 @@ Exactly four distinct options, one correct index 0-3. No markdown."""
                 and isinstance(candidate.get("explanation"), str) and candidate["explanation"].strip()):
                 generated = candidate
                 break
-        except Exception as e:
-            print('GEMINI EXCEPTION:', e)
+        except Exception:
+            logger.warning("quiz_ai_attempt_failed model=%s", model, exc_info=True)
             continue
     if not generated:
         # Fallback due to Gemini Quota Exhaustion
@@ -1763,8 +1966,8 @@ Rules:
                 if isinstance(candidate, dict) and "key_concepts" in candidate:
                     generated = candidate
                     break
-            except Exception as e:
-                print(f"GEMINI EXCEPTION in Notes Gen: {e}")
+            except Exception:
+                logger.warning("notes_ai_attempt_failed model=%s", model, exc_info=True)
                 continue
 
         if not generated:
@@ -1992,8 +2195,8 @@ Keep your explanation under 200 words."""
                 h.explanation = explanation[:1000]
                 db.commit()
                 return {"explanation": explanation, "highlight_id": highlight_id}
-        except Exception as e:
-            print('GEMINI EXCEPTION:', e)
+        except Exception:
+            logger.warning("highlight_ai_attempt_failed model=%s", model, exc_info=True)
             continue
     raise HTTPException(status_code=503, detail="Could not generate explanation")
 
@@ -2130,8 +2333,8 @@ Respond as a live tutor: conversational, clear, and supportive. Use examples and
             if response.text and response.text.strip():
                 ai_response = response.text.strip()
                 break
-        except Exception as e:
-            print('GEMINI EXCEPTION:', e)
+        except Exception:
+            logger.warning("tutor_ai_attempt_failed model=%s", model, exc_info=True)
             continue
 
     if not ai_response:
@@ -2165,8 +2368,8 @@ Respond as a live tutor: conversational, clear, and supportive. Use examples and
                 
                 if not ai_response:
                     ai_response = "That's an interesting question! I can help you understand that better. Could you elaborate a bit more on what specifically you're struggling with?"
-            except Exception as e:
-                print('WIKI ERROR:', e)
+            except Exception:
+                logger.warning("tutor_reference_fallback_failed", exc_info=True)
                 ai_response = "That's an interesting question! I can help you understand that better. Could you elaborate a bit more on what specifically you're struggling with?"
 
     # Append both turns to transcript
@@ -2449,8 +2652,8 @@ Evaluate this answer for a networking/cybersecurity lab. Return JSON:
             result = json.loads(response.text)
             if isinstance(result, dict) and "correct" in result:
                 return {**result, "scenario_id": payload.scenario_id, "step": payload.step}
-        except Exception as e:
-            print('GEMINI EXCEPTION:', e)
+        except Exception:
+            logger.warning("lab_ai_attempt_failed model=%s", model, exc_info=True)
             continue
 
     # Fallback if Gemini fails

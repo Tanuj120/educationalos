@@ -210,6 +210,14 @@ docker compose down -v       # Also removes the database volume
 | `YOUTUBE_CACHE_TTL_SECONDS` | No | `900` | In-memory YouTube result cache duration |
 | `GOOGLE_MEET_CLIENT_ID` | No | — | Google OAuth Client ID for Meet integration |
 | `DATABASE_URL` | No | `sqlite:///./nexus.db` | PostgreSQL URL (set automatically in Docker) |
+| `MAX_PDF_UPLOAD_BYTES` | No | `26214400` | Maximum size of one PDF (25 MB) |
+| `MAX_VIDEO_UPLOAD_BYTES` | No | `262144000` | Maximum size of one teacher video (250 MB) |
+| `MAX_FILES_PER_UPLOAD` | No | `5` | Maximum PDFs accepted in one request |
+| `RATE_LIMIT_AI_REQUESTS` | No | `20` | Ask NEXUS requests allowed per user/IP window |
+| `RATE_LIMIT_UPLOAD_REQUESTS` | No | `10` | Upload requests allowed per user/IP window |
+| `RATE_LIMIT_WRITE_REQUESTS` | No | `60` | Other write requests allowed per user/IP window |
+| `RATE_LIMIT_WINDOW_SECONDS` | No | `60` | Rate-limit window length |
+| `LOG_LEVEL` | No | `INFO` | Backend structured log level |
 
 > Without `GEMINI_API_KEY`, the app runs but answers show a configuration message. Materials are saved but marked `PARSED_AWAITING_EMBEDDINGS` and lexical retrieval is used as fallback.
 
@@ -278,7 +286,7 @@ Full interactive docs: **http://localhost:8001/docs**
 |---|---|---|
 | Courses | `/api/v1/courses` | Create, list, update, delete courses |
 | Units | `/api/v1/courses/{id}/units` | Manage course units |
-| Materials | `/api/v1/materials` | Upload PDFs, trigger reindex |
+| Materials | `/api/v1/materials` | Upload PDFs, trigger reindex, inspect processing status |
 | Ask / Chat | `/api/v1/ask`, `/api/v1/ask/stream` | RAG-grounded Q&A (streaming SSE) |
 | Quiz | `/api/v1/quiz` | Generate and answer adaptive quiz questions |
 | Progress | `/api/v1/progress` | Topic mastery signals |
@@ -290,7 +298,8 @@ Full interactive docs: **http://localhost:8001/docs**
 | Videos | `/api/v1/teacher/videos`, `/api/v1/video-lectures/library` | Teacher video uploads and student library |
 | YouTube | `/api/v1/youtube/recommendations` | On-demand video recommendations |
 | Live Sessions | `/api/v1/live-sessions` | Voice tutor session records |
-| Health | `/health` | Server health check |
+| Upload status | `/api/v1/uploads/status`, `/api/v1/materials/{id}/status` | Per-user processing state and failures |
+| Health | `/health` | API, live database, upload storage, AI configuration, and AI outcome counters |
 
 ### Auth headers (temporary, pre-JWT)
 
@@ -449,7 +458,7 @@ docker compose up -d --force-recreate backend
 
 NEXUS sends extracted text chunks to Gemini's `gemini-embedding-001` model with a fixed 1,536 dimensions, then stores each returned vector in PostgreSQL's `pgvector` column. Ask NEXUS uses `gemini-3.8-flash`: select a course and unit, and it retrieves the most relevant chunks across every PDF in that unit before answering. Without an API key, materials are marked `PARSED_AWAITING_EMBEDDINGS` instead of falsely claiming embeddings were created. Existing uploads can be reprocessed through `POST /api/v1/materials/{material_id}/reindex`.
 
-API ownership currently uses the temporary `X-User-ID` header until full authentication is connected.
+API ownership currently uses matching `X-User-ID` and `X-User-Role` headers. The backend rejects missing identities and student/teacher role mismatches, but these headers are still a prototype boundary rather than cryptographically signed authentication. Replace them with signed server sessions before public deployment.
 
 ## YouTube learning recommendations
 
@@ -474,6 +483,6 @@ Successful Ask NEXUS turns are stored in PostgreSQL (`chat_turns`) and remain av
 
 For a new question, NEXUS sends the most recent turns from the selected unit, a small number of older turns about the same topic, and the learner's recorded weak topics to Gemini along with the relevant PDF material. A `Still confused` action lowers the estimated topic strength and asks for a different explanation. `I understand` is a light positive signal. A generated four-option quiz is graded server-side; wrong answers and the chosen option are stored, and subsequent explanations receive those mistakes as context. Repeated correct answers can raise a topic above the focus threshold of 70%. The score is an estimate, not proof of mastery.
 
-The records live in the `nexus_postgres_data` Docker volume. `docker compose down` keeps that volume; `docker compose down -v` removes it. Current sign-in is local UI state and all frontend API calls still use the temporary `local-user` identity, so multi-account isolation needs real authentication before use beyond the local demo.
+The records live in the `nexus_postgres_data` Docker volume. `docker compose down` keeps that volume; `docker compose down -v` removes it. Current sign-in is local UI state and sends a role-matched prototype identity header, so signed server-side authentication is still required before use beyond the local demo.
 
 Each course unit now has a **Practice unit** entry in Materials and a **Start unit quiz** action in Ask NEXUS. A quiz can start from the unit's PDFs without a prior chat, including scanned PDFs read through Gemini. The backend chooses a recorded weak topic first, stores every answer, and includes recent mistakes when creating the next question. Difficulty follows the unit's estimated topic strength: below 55% is foundational, 55–74% is intermediate, and 75% or above is advanced. A correct answer adds 18 points; a wrong answer removes 18. These values are simple learning estimates for the local MVP.
