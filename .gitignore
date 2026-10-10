@@ -1,0 +1,24 @@
+# Local secrets
+.env
+backend/.env
+
+# Dependencies and build output
+frontend/node_modules/
+frontend/dist/
+site/node_modules/
+site/
+nexus-site.tar.gz
+
+# Python runtime files
+backend/.venv/
+backend/**/__pycache__/
+backend/**/*.py[cod]
+
+# Runtime data and logs
+backend/uploads/*
+!backend/uploads/.gitkeep
+*.log
+
+# Editor and OS metadata
+.DS_Store
+Thumbs.db
