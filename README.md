@@ -211,6 +211,7 @@ docker compose down -v       # Also removes the database volume
 | `GOOGLE_MEET_CLIENT_ID` | No | — | Google OAuth Client ID for Meet integration |
 | `DATABASE_URL` | No | `sqlite:///./nexus.db` | PostgreSQL URL (set automatically in Docker) |
 | `MAX_PDF_UPLOAD_BYTES` | No | `26214400` | Maximum size of one PDF (25 MB) |
+| `MAX_BOOK_UPLOAD_BYTES` | No | `104857600` | Maximum size of one complete textbook (100 MB) |
 | `MAX_VIDEO_UPLOAD_BYTES` | No | `262144000` | Maximum size of one teacher video (250 MB) |
 | `MAX_FILES_PER_UPLOAD` | No | `5` | Maximum PDFs accepted in one request |
 | `RATE_LIMIT_AI_REQUESTS` | No | `20` | Ask NEXUS requests allowed per user/IP window |
@@ -287,6 +288,7 @@ Full interactive docs: **http://localhost:8001/docs**
 | Courses | `/api/v1/courses` | Create, list, update, delete courses |
 | Units | `/api/v1/courses/{id}/units` | Manage course units |
 | Materials | `/api/v1/materials` | Upload PDFs, trigger reindex, inspect processing status |
+| Book import | `/api/v1/courses/{id}/book`, `/api/v1/courses/{id}/book-imports` | Upload a textbook, detect sections, and track automatic unit creation |
 | Ask / Chat | `/api/v1/ask`, `/api/v1/ask/stream` | RAG-grounded Q&A (streaming SSE) |
 | Quiz | `/api/v1/quiz` | Generate and answer adaptive quiz questions |
 | Progress | `/api/v1/progress` | Topic mastery signals |

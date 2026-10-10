@@ -3,9 +3,10 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import fitz
 from fastapi import HTTPException, UploadFile
 
-from app.main import save_upload_with_limit, validated_identity
+from app.main import detect_book_sections, save_upload_with_limit, validated_identity
 
 
 class RoleProtectionTests(unittest.TestCase):
@@ -41,6 +42,35 @@ class UploadLimitTests(unittest.IsolatedAsyncioTestCase):
                 await save_upload_with_limit(upload, destination, 32)
             self.assertEqual(oversized.exception.status_code, 413)
             self.assertFalse(destination.exists())
+
+
+class BookSectionDetectionTests(unittest.TestCase):
+    def test_prefers_the_pdf_outline_for_real_chapter_boundaries(self):
+        document = fitz.open()
+        try:
+            for number in range(6):
+                page = document.new_page()
+                page.insert_text((72, 72), f"Page {number + 1}")
+            document.set_toc([[1, "Foundations", 1], [1, "Routing", 3], [1, "Security", 5]])
+            sections, method = detect_book_sections(document)
+            self.assertEqual(method, "PDF_OUTLINE")
+            self.assertEqual([item["title"] for item in sections], ["Foundations", "Routing", "Security"])
+            self.assertEqual([(item["start_page"], item["end_page"]) for item in sections], [(0, 1), (2, 3), (4, 5)])
+        finally:
+            document.close()
+
+    def test_falls_back_to_bounded_page_groups_without_using_watermarks_as_titles(self):
+        document = fitz.open()
+        try:
+            for _ in range(51):
+                page = document.new_page()
+                page.insert_text((72, 72), "Scanned by CamScanner", fontsize=18)
+            sections, method = detect_book_sections(document)
+            self.assertEqual(method, "PAGE_GROUPS")
+            self.assertEqual(len(sections), 3)
+            self.assertTrue(all(item["title"].startswith("Part ") for item in sections))
+        finally:
+            document.close()
 
 
 if __name__ == "__main__":

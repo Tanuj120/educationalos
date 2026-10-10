@@ -86,6 +86,7 @@ CHAT_MODEL = os.getenv("GEMINI_CHAT_MODEL", "gemini-3.8-flash")
 CHAT_MODELS = tuple(dict.fromkeys((CHAT_MODEL, "gemini-3.5-flash-lite", "gemini-3.5-flash", "gemini-3.6-flash")))
 EMBEDDING_RETRY_AFTER_SECONDS = int(os.getenv("EMBEDDING_RETRY_AFTER_SECONDS", "300"))
 MAX_PDF_UPLOAD_BYTES = int(os.getenv("MAX_PDF_UPLOAD_BYTES", str(25 * 1024 * 1024)))
+MAX_BOOK_UPLOAD_BYTES = int(os.getenv("MAX_BOOK_UPLOAD_BYTES", str(100 * 1024 * 1024)))
 MAX_VIDEO_UPLOAD_BYTES = int(os.getenv("MAX_VIDEO_UPLOAD_BYTES", str(250 * 1024 * 1024)))
 MAX_FILES_PER_UPLOAD = int(os.getenv("MAX_FILES_PER_UPLOAD", "5"))
 RATE_LIMIT_WINDOW_SECONDS = int(os.getenv("RATE_LIMIT_WINDOW_SECONDS", "60"))
@@ -127,6 +128,7 @@ class Course(Base):
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
     units: Mapped[list["Unit"]] = relationship(back_populates="course", cascade="all, delete-orphan", order_by="Unit.position")
+    book_imports: Mapped[list["BookImport"]] = relationship(back_populates="course", cascade="all, delete-orphan")
 
 
 class Unit(Base):
@@ -152,6 +154,22 @@ class Material(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
     unit: Mapped[Unit] = relationship(back_populates="materials")
     chunks: Mapped[list["DocumentChunk"]] = relationship(back_populates="material", cascade="all, delete-orphan")
+
+
+class BookImport(Base):
+    """A course-level textbook that is split into editable units in the background."""
+    __tablename__ = "book_imports"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    course_id: Mapped[str] = mapped_column(ForeignKey("courses.id", ondelete="CASCADE"), index=True)
+    original_name: Mapped[str] = mapped_column(String(255))
+    storage_key: Mapped[str] = mapped_column(String(500), unique=True)
+    status: Mapped[str] = mapped_column(String(32), default="QUEUED")
+    progress_message: Mapped[str] = mapped_column(String(255), default="Waiting to scan the book")
+    chapter_count: Mapped[int] = mapped_column(Integer, default=0)
+    unit_ids: Mapped[list] = mapped_column(JSON, default=list)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True)
+    course: Mapped[Course] = relationship(back_populates="book_imports")
 
 
 class DocumentChunk(Base):
@@ -461,6 +479,20 @@ def record_ai_result(result: str) -> None:
 
 def serialize_material(material: Material) -> dict:
     return {"id": material.id, "name": material.original_name, "status": material.status, "chunk_count": material.chunk_count, "error": material.error_message}
+
+
+def serialize_book_import(book: BookImport) -> dict:
+    return {
+        "id": book.id,
+        "course_id": book.course_id,
+        "name": book.original_name,
+        "status": book.status,
+        "progress": book.progress_message,
+        "chapter_count": book.chapter_count,
+        "unit_ids": book.unit_ids or [],
+        "error": book.error_message,
+        "created_at": book.created_at.isoformat(),
+    }
 
 
 def serialize_course(course: Course) -> dict:
@@ -1015,6 +1047,181 @@ Read the document pages directly. Use prior turns to understand follow-ups. For 
         yield grounded_fallback_answer(question, unit_title, context)
 
 
+def clean_unit_title(value: str, fallback: str) -> str:
+    title = re.sub(r"\s+", " ", value or "").strip(" .:-\t")
+    return (title or fallback)[:180]
+
+
+def first_page_heading(document, page_index: int) -> str | None:
+    """Use the most prominent short text on a page as a deterministic fallback title."""
+    if page_index < 0 or page_index >= document.page_count:
+        return None
+    candidates: list[tuple[float, str]] = []
+    try:
+        page_dict = document[page_index].get_text("dict")
+        for block in page_dict.get("blocks", []):
+            for line in block.get("lines", []):
+                spans = line.get("spans", [])
+                text_value = " ".join(span.get("text", "").strip() for span in spans).strip()
+                lowered = text_value.casefold()
+                is_watermark = any(token in lowered for token in ("camscanner", "scanned by", "copyright", "all rights reserved"))
+                if 4 <= len(text_value) <= 120 and not is_watermark and not re.fullmatch(r"[\d\W]+", text_value):
+                    size = max((float(span.get("size", 0)) for span in spans), default=0)
+                    candidates.append((size, text_value))
+    except Exception:
+        return None
+    return clean_unit_title(max(candidates, default=(0, ""), key=lambda item: item[0])[1], "") or None
+
+
+def detect_book_sections(document) -> tuple[list[dict], str]:
+    """Prefer the embedded PDF outline and provide bounded page groups when none exists."""
+    page_count = document.page_count
+    if page_count < 1:
+        raise ValueError("The PDF contains no pages")
+    raw_toc = document.get_toc(simple=True) or []
+    valid_toc = [row for row in raw_toc if len(row) >= 3 and isinstance(row[2], int) and 1 <= row[2] <= page_count]
+    outline_entries: list = []
+    if valid_toc:
+        minimum_level = min(int(row[0]) for row in valid_toc)
+        outline_entries = [row for row in valid_toc if int(row[0]) == minimum_level]
+        if len(outline_entries) < 2:
+            outline_entries = [row for row in valid_toc if int(row[0]) <= minimum_level + 1]
+
+    starts: list[tuple[str, int]] = []
+    seen_pages: set[int] = set()
+    for index, row in enumerate(outline_entries[:40], start=1):
+        start = int(row[2]) - 1
+        if start in seen_pages:
+            continue
+        seen_pages.add(start)
+        starts.append((clean_unit_title(str(row[1]), f"Chapter {index}"), start))
+
+    method = "PDF_OUTLINE"
+    if len(starts) < 2:
+        method = "PAGE_GROUPS"
+        target_count = min(12, max(1, math.ceil(page_count / 25)))
+        pages_per_unit = max(1, math.ceil(page_count / target_count))
+        starts = []
+        for start in range(0, page_count, pages_per_unit):
+            number = len(starts) + 1
+            heading = first_page_heading(document, start)
+            fallback = f"Part {number} — Pages {start + 1}–{min(page_count, start + pages_per_unit)}"
+            starts.append((clean_unit_title(heading or fallback, fallback), start))
+
+    starts.sort(key=lambda item: item[1])
+    sections: list[dict] = []
+    used_titles: dict[str, int] = {}
+    for index, (title, start) in enumerate(starts):
+        end = (starts[index + 1][1] - 1) if index + 1 < len(starts) else page_count - 1
+        if end < start:
+            continue
+        used_titles[title] = used_titles.get(title, 0) + 1
+        unique_title = title if used_titles[title] == 1 else f"{title} ({used_titles[title]})"
+        sections.append({"title": unique_title, "start_page": start, "end_page": end})
+    return sections, method
+
+
+def process_book_import(book_import_id: str) -> None:
+    """Split one textbook into unit PDFs, index them, and expose progress throughout."""
+    db = SessionLocal()
+    document = None
+    book: BookImport | None = None
+    generated_paths: list[Path] = []
+    material_ids: list[str] = []
+    try:
+        book = db.get(BookImport, book_import_id)
+        if not book:
+            return
+        course = db.get(Course, book.course_id)
+        if not course:
+            return
+        book.status = "SCANNING"
+        book.progress_message = "Reading the book outline and chapter structure"
+        db.commit()
+        document = fitz.open(book.storage_key)
+        if document.needs_pass:
+            raise ValueError("Password-protected PDFs are not supported")
+        sections, detection_method = detect_book_sections(document)
+        if not sections:
+            raise ValueError("No usable sections could be detected")
+        book.status = "CREATING_UNITS"
+        book.progress_message = f"Creating {len(sections)} editable units"
+        book.chapter_count = len(sections)
+        db.commit()
+
+        base_position = db.query(Unit).filter(Unit.course_id == course.id).count()
+        unit_ids: list[str] = []
+        book_stem = Path(book.original_name).stem[:80]
+        for offset, section in enumerate(sections):
+            unit = Unit(course_id=course.id, title=section["title"], position=base_position + offset)
+            db.add(unit)
+            db.flush()
+            chapter_id = str(uuid.uuid4())
+            chapter_path = UPLOAD_DIR / f"book_{book.id}_{chapter_id}.pdf"
+            chapter_document = fitz.open()
+            try:
+                chapter_document.insert_pdf(document, from_page=section["start_page"], to_page=section["end_page"])
+                chapter_document.save(chapter_path, garbage=4, deflate=True)
+            finally:
+                chapter_document.close()
+            generated_paths.append(chapter_path)
+            material = Material(
+                id=chapter_id,
+                unit_id=unit.id,
+                original_name=f"{book_stem} — {section['title']}.pdf"[:255],
+                storage_key=str(chapter_path),
+                status="QUEUED",
+            )
+            db.add(material)
+            unit_ids.append(unit.id)
+            material_ids.append(material.id)
+        book.unit_ids = unit_ids
+        book.status = "INDEXING"
+        book.progress_message = f"Indexing {len(material_ids)} units for Ask NEXUS and quizzes"
+        db.commit()
+
+        for index, material_id in enumerate(material_ids, start=1):
+            book = db.get(BookImport, book_import_id)
+            if book:
+                book.progress_message = f"Indexing unit {index} of {len(material_ids)}"
+                db.commit()
+            ingest_material(material_id)
+
+        db.expire_all()
+        book = db.get(BookImport, book_import_id)
+        materials = db.query(Material).filter(Material.id.in_(material_ids)).all()
+        failed_count = sum(material.status == "FAILED" for material in materials)
+        if book:
+            book.status = "READY" if failed_count == 0 else "PARTIAL"
+            book.progress_message = (
+                f"{len(material_ids)} units are ready to learn"
+                if failed_count == 0 else
+                f"{len(material_ids) - failed_count} units are ready; {failed_count} need attention"
+            )
+            book.error_message = None if failed_count == 0 else "Some chapters could not be indexed. You can retry those PDFs individually."
+            db.commit()
+        logger.info(
+            "book_import_completed book_import_id=%s method=%s units=%s failed=%s",
+            book_import_id, detection_method, len(material_ids), failed_count,
+        )
+    except Exception:
+        db.rollback()
+        book = db.get(BookImport, book_import_id)
+        if book:
+            book.status = "FAILED"
+            book.progress_message = "Book processing failed"
+            book.error_message = "NEXUS could not detect and prepare this book. Check that it is a readable, unlocked PDF."
+            db.commit()
+        if not book or not (book.unit_ids or []):
+            for generated_path in generated_paths:
+                generated_path.unlink(missing_ok=True)
+        logger.exception("book_import_failed book_import_id=%s", book_import_id)
+    finally:
+        if document is not None:
+            document.close()
+        db.close()
+
+
 def ingest_material(material_id: str) -> None:
     """Parse a PDF, generate embeddings, and persist chunks in pgvector."""
     db = SessionLocal()
@@ -1075,7 +1282,7 @@ def rate_limit_policy(request: Request) -> tuple[str, int] | None:
     path = request.url.path
     if path in {"/api/v1/ask", "/api/v1/ask/stream"}:
         return "ai", RATE_LIMIT_AI_REQUESTS
-    if "/materials" in path or path == "/api/v1/teacher/videos":
+    if "/materials" in path or path.endswith("/book") or path == "/api/v1/teacher/videos":
         return "upload", RATE_LIMIT_UPLOAD_REQUESTS
     return "write", RATE_LIMIT_WRITE_REQUESTS
 
@@ -1189,10 +1396,65 @@ def create_course(payload: CourseCreate, db: Session = Depends(get_db), user_id:
     return serialize_course(course)
 
 
+@app.post("/api/v1/courses/{course_id}/book", status_code=status.HTTP_202_ACCEPTED)
+async def upload_course_book(
+    course_id: str,
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    user_id: str = Depends(current_student_id),
+) -> dict:
+    """Accept one complete textbook and prepare chapter-based units in the background."""
+    course = require_course(course_id, user_id, db)
+    active_import = db.query(BookImport).filter(
+        BookImport.course_id == course.id,
+        BookImport.status.in_(["QUEUED", "SCANNING", "CREATING_UNITS", "INDEXING"]),
+    ).first()
+    if active_import:
+        raise HTTPException(status_code=409, detail="A book is already being processed for this course")
+    suffix = Path(file.filename or "").suffix.lower()
+    if suffix != ".pdf" or file.content_type not in {"application/pdf", "application/octet-stream"}:
+        raise HTTPException(status_code=415, detail="Upload a valid PDF textbook")
+    book_id = str(uuid.uuid4())
+    safe_name = re.sub(r"[^A-Za-z0-9._-]", "_", file.filename or "textbook.pdf")
+    storage_path = UPLOAD_DIR / f"book_{book_id}_{safe_name}"
+    await save_upload_with_limit(file, storage_path, MAX_BOOK_UPLOAD_BYTES)
+    with storage_path.open("rb") as stored_file:
+        if stored_file.read(5) != b"%PDF-":
+            storage_path.unlink(missing_ok=True)
+            raise HTTPException(status_code=415, detail="The uploaded file is not a valid PDF")
+    book = BookImport(
+        id=book_id,
+        course_id=course.id,
+        original_name=file.filename or "textbook.pdf",
+        storage_key=str(storage_path),
+        status="QUEUED",
+        progress_message="Book uploaded; waiting to scan its chapters",
+    )
+    db.add(book)
+    db.commit()
+    db.refresh(book)
+    background_tasks.add_task(process_book_import, book.id)
+    logger.info("book_import_queued user_id=%s course_id=%s book_import_id=%s", user_id, course.id, book.id)
+    return serialize_book_import(book)
+
+
+@app.get("/api/v1/courses/{course_id}/book-imports")
+def list_course_book_imports(
+    course_id: str,
+    db: Session = Depends(get_db),
+    user_id: str = Depends(current_student_id),
+) -> list[dict]:
+    course = require_course(course_id, user_id, db)
+    imports = db.query(BookImport).filter(BookImport.course_id == course.id).order_by(BookImport.created_at.desc()).all()
+    return [serialize_book_import(item) for item in imports]
+
+
 @app.delete("/api/v1/courses/{course_id}")
 def delete_course(course_id: str, db: Session = Depends(get_db), user_id: str = Depends(current_user_id)) -> dict:
     course = require_course(course_id, user_id, db)
     storage_keys = [material.storage_key for unit in course.units for material in unit.materials]
+    storage_keys.extend(book.storage_key for book in course.book_imports)
     db.delete(course)
     db.commit()
     remove_stored_files(storage_keys)

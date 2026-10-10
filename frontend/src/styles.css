@@ -1806,4 +1806,33 @@ body,
  .compact-teacher-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
 
+/* Course-level textbook ingestion and automatically generated learning units. */
+.book-import-panel { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 18px; margin: 20px 0 14px; border: 1px solid #d8e4f2 !important; background: linear-gradient(135deg, #f8fbff, #f1f6fc) !important; padding: 20px !important; }
+.book-import-intro { display: flex; align-items: center; gap: 14px; min-width: 0; }
+.book-import-icon { display: grid; width: 46px; height: 46px; flex: 0 0 auto; place-items: center; border: 1px solid #cbdcf0; border-radius: 12px; background: #fff; color: #4776c1; font-size: 20px; }
+.book-import-intro h3 { margin: 5px 0 4px; color: #21364f; font-size: 18px; }
+.book-import-intro p { max-width: 650px; margin: 0 !important; color: #718097 !important; font-size: 12px !important; line-height: 1.5; }
+.book-upload-button { position: relative; overflow: hidden; display: inline-flex; min-height: 42px; align-items: center; justify-content: center; border: 1px solid #4776c1; border-radius: 8px; background: #4776c1; color: #fff; padding: 10px 15px; font-size: 12px; font-weight: 750; white-space: nowrap; cursor: pointer; }
+.book-upload-button input { position: absolute; inset: 0; opacity: 0; cursor: pointer; }
+.book-upload-button.disabled { border-color: #aabbd0; background: #aabbd0; cursor: wait; }
+.book-upload-button.disabled input { cursor: wait; }
+.book-import-progress { grid-column: 1 / -1; display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 5px 14px; align-items: center; border-top: 1px solid #dce6f2; padding-top: 14px; }
+.book-import-progress > div { display: grid; gap: 3px; min-width: 0; }
+.book-import-progress b { overflow: hidden; color: #29405c; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
+.book-import-progress span { color: #73849a; font-size: 11px; }
+.book-import-progress strong { border-radius: 999px; background: #e4edf9; color: #426da9; padding: 6px 10px; font-size: 9px; letter-spacing: .06em; white-space: nowrap; }
+.book-import-progress.ready strong { background: #e5f5eb; color: #31805a; }
+.book-import-progress.failed strong,
+.book-import-progress.partial strong { background: #faeaea; color: #aa4f4f; }
+.book-import-progress small { grid-column: 1 / -1; color: #a44e4e; font-size: 10px; }
+.unit-edit-button { border: 0; background: transparent; color: #66809e; padding: 7px 5px; font-size: 11px; font-weight: 700; cursor: pointer; }
+.unit-edit-button:hover { color: #4776c1; }
+
+@media (max-width: 760px) {
+  .book-import-panel { grid-template-columns: 1fr; }
+  .book-upload-button { width: 100%; }
+  .book-import-progress { grid-column: 1; grid-template-columns: 1fr; }
+  .book-import-progress strong { justify-self: start; }
+}
+
 
